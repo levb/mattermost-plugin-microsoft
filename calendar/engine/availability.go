@@ -4,7 +4,9 @@
 package engine
 
 import (
+	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/mattermost/mattermost-server/v6/model"
@@ -27,6 +29,9 @@ const (
 	upcomingEventNotificationWindow = (StatusSyncJobInterval * 11) / 10 // 110% of the interval
 	logTruncateMsg                  = "We've truncated the logs due to too many messages"
 	logTruncateLimit                = 5
+
+	// defaultConcurrency is the default number of workers to span for calendar providers that doesn't allow batch requests
+	defaultConcurrency = 4
 )
 
 var (
@@ -37,6 +42,7 @@ type StatusSyncJobSummary struct {
 	NumberOfUsersFailedStatusChanged int
 	NumberOfUsersStatusChanged       int
 	NumberOfUsersProcessed           int
+	CalendarEvents                   *remote.ViewCalendarResponse
 }
 
 type Availability interface {
@@ -84,12 +90,7 @@ func (m *mscalendar) SyncAll() (string, *StatusSyncJobSummary, error) {
 }
 
 // retrieveUsersToSync retrieves the users and their calendar data to sync up and send notifications
-// The parameter fetchIndividually determines if the calendar data should be fetched while we loop the
-// users (using individual credentials) or on a batch after the loop.
-func (m *mscalendar) retrieveUsersToSync(userIndex store.UserIndex, syncJobSummary *StatusSyncJobSummary, fetchIndividually bool) ([]*store.User, []*remote.ViewCalendarResponse, error) {
-	start := time.Now().UTC()
-	end := time.Now().UTC().Add(calendarViewTimeWindowSize)
-
+func (m *mscalendar) retrieveUsersToSync(userIndex store.UserIndex, syncJobSummary *StatusSyncJobSummary) ([]*store.User, []*remote.ViewCalendarResponse, error) {
 	numberOfLogs := 0
 	users := []*store.User{}
 	calendarViews := []*remote.ViewCalendarResponse{}
@@ -115,44 +116,132 @@ func (m *mscalendar) retrieveUsersToSync(userIndex store.UserIndex, syncJobSumma
 		}
 
 		users = append(users, user)
-
-		if fetchIndividually {
-			engine, err := m.FilterCopy(withActingUser(user.MattermostUserID))
-			if err != nil {
-				m.Logger.Warnf("Not able to enable active user %s from user index. err=%v", user.MattermostUserID, err)
-				continue
-			}
-
-			calendarUser := newUserFromStoredUser(user)
-			calendarEvents, err := engine.GetCalendarEvents(calendarUser, start, end, true)
-			if err != nil {
-				syncJobSummary.NumberOfUsersFailedStatusChanged++
-				m.Logger.With(bot.LogContext{
-					"user": u.MattermostUserID,
-					"err":  err,
-				}).Errorf("error getting calendar events")
-				continue
-			}
-			calendarViews = append(calendarViews, calendarEvents)
-		}
 	}
 	if len(users) == 0 {
 		return users, calendarViews, errNoUsersNeedToBeSynced
 	}
 
-	if !fetchIndividually {
-		var err error
-		calendarViews, err = m.GetCalendarViews(users)
-		if err != nil {
-			return users, calendarViews, errors.Wrap(err, "not able to get calendar views for connected users")
-		}
+	var err error
+	calendarViews, err = m.GetCalendarViews(users)
+	if err != nil {
+		return users, calendarViews, errors.Wrap(err, "not able to get calendar views for connected users")
 	}
 
 	if len(calendarViews) == 0 {
-		return users, calendarViews, fmt.Errorf("no calendar views found")
+		return users, calendarViews, errors.New("no calendar views found")
 	}
 
 	return users, calendarViews, nil
+}
+
+func (m *mscalendar) retrieveUsersToSyncUsingGoroutines(ctx context.Context, userIndex store.UserIndex, syncJobSummary *StatusSyncJobSummary, concurrency int) ([]*store.User, []*remote.ViewCalendarResponse, error) {
+	ctxTimeout, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+
+	start := time.Now().UTC()
+	end := time.Now().UTC().Add(calendarViewTimeWindowSize)
+
+	numberOfLogs := 0
+	users := []*store.User{}
+	calendarViews := []*remote.ViewCalendarResponse{}
+	for _, u := range userIndex {
+		user, err := m.Store.LoadUser(u.MattermostUserID)
+		if err != nil {
+			syncJobSummary.NumberOfUsersFailedStatusChanged++
+			if numberOfLogs < logTruncateLimit {
+				m.Logger.Warnf("Not able to load user %s from user index. err=%v", u.MattermostUserID, err)
+			} else if numberOfLogs == logTruncateLimit {
+				m.Logger.Warnf(logTruncateMsg)
+			}
+			numberOfLogs++
+			continue
+		}
+
+		// If user does not have the proper features enabled, just go to the next one
+		if !(user.Settings.UpdateStatus || user.Settings.ReceiveReminders) {
+			continue
+		}
+
+		users = append(users, user)
+	}
+
+	if len(users) == 0 {
+		return users, calendarViews, errNoUsersNeedToBeSynced
+	}
+
+	in := make(chan store.User)
+	out := make(chan StatusSyncJobSummary)
+	var wg sync.WaitGroup
+
+	// Start workers
+	for i := 0; i <= concurrency; i++ {
+		wg.Add(1)
+		go func(m mscalendar, c context.Context, w *sync.WaitGroup, in chan store.User, out chan StatusSyncJobSummary) {
+			defer w.Done()
+			for {
+				select {
+				case <-c.Done():
+					m.Logger.Errorf("Timeout processing users availability")
+					return
+				case user, ok := <-in:
+					if !ok {
+						// Closed channel
+						return
+					}
+
+					js := StatusSyncJobSummary{}
+					engine, err := m.FilterCopy(withActingUser(user.MattermostUserID))
+					if err != nil {
+						m.Logger.Warnf("Not able to enable active user %s from user index. err=%v", user.MattermostUserID, err)
+						continue
+					}
+
+					calendarUser := newUserFromStoredUser(&user)
+					js.CalendarEvents, err = engine.GetCalendarEvents(calendarUser, start, end, true)
+					if err != nil {
+						js.NumberOfUsersFailedStatusChanged++
+						m.Logger.With(bot.LogContext{
+							"user": user.MattermostUserID,
+							"err":  err,
+						}).Errorf("error getting calendar events")
+						continue
+					}
+
+					out <- js
+				}
+			}
+		}(*m, ctxTimeout, &wg, in, out)
+	}
+
+	// Populate the input channel with the users and wait for the workers to finish
+	go func(users []*store.User, in chan store.User, out chan StatusSyncJobSummary) {
+		for _, user := range users {
+			in <- *user
+		}
+		close(in)
+
+		wg.Wait()
+		close(out)
+	}(users, in, out)
+
+	// Read results and wait until all workers have finished.
+	for {
+		select {
+		case js, ok := <-out:
+			if !ok {
+				if len(calendarViews) == 0 {
+					return users, calendarViews, errors.New("no calendar views found")
+				}
+
+				return users, calendarViews, nil
+			}
+
+			syncJobSummary.NumberOfUsersFailedStatusChanged += js.NumberOfUsersFailedStatusChanged
+			calendarViews = append(calendarViews, js.CalendarEvents)
+		case <-ctxTimeout.Done():
+			return users, calendarViews, ctxTimeout.Err()
+		}
+	}
 }
 
 func (m *mscalendar) syncUsers(userIndex store.UserIndex, fetchIndividually bool) (string, *StatusSyncJobSummary, error) {
@@ -162,7 +251,16 @@ func (m *mscalendar) syncUsers(userIndex store.UserIndex, fetchIndividually bool
 	}
 	syncJobSummary.NumberOfUsersProcessed = len(userIndex)
 
-	users, calendarViews, err := m.retrieveUsersToSync(userIndex, syncJobSummary, fetchIndividually)
+	var users []*store.User
+	var calendarViews []*remote.ViewCalendarResponse
+	var err error
+
+	if fetchIndividually {
+		users, calendarViews, err = m.retrieveUsersToSyncUsingGoroutines(context.Background(), userIndex, syncJobSummary, defaultConcurrency)
+	} else {
+		users, calendarViews, err = m.retrieveUsersToSync(userIndex, syncJobSummary)
+	}
+
 	if err != nil {
 		return err.Error(), syncJobSummary, errors.Wrapf(err, "error retrieving users to sync (individually=%v)", fetchIndividually)
 	}

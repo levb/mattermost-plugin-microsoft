@@ -389,8 +389,47 @@ func TestReminders(t *testing.T) {
 	}
 }
 
-func TestRetrieveUsersToSyncIndividually(t *testing.T) {
+func TestRetrieveUsersToSyncUsingGoroutines(t *testing.T) {
+	concurrency := 2
+
+	t.Run("context is cancelled", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		testUser := newTestUser()
+		testUser.Settings.UpdateStatus = true
+		testUser.Settings.ReceiveReminders = true
+		userIndex := []*store.UserShort{
+			{
+				MattermostUserID: testUser.MattermostUserID,
+				RemoteID:         testUser.Remote.ID,
+				Email:            testUser.Remote.Mail,
+			},
+		}
+
+		ctrl := gomock.NewController(t)
+		defer ctrl.Finish()
+
+		e, client := makeStatusSyncTestEnv(ctrl)
+
+		c, s, p, r := client.(*mock_remote.MockClient), e.Store.(*mock_store.MockStore), e.PluginAPI.(*mock_plugin_api.MockPluginAPI), e.Remote.(*mock_remote.MockRemote)
+		p.EXPECT().GetMattermostUser(testUser.MattermostUserID).Return(&model.User{Id: testUser.MattermostUserID}, nil).AnyTimes()
+		s.EXPECT().LoadUser(testUser.MattermostUserID).Return(testUser, nil).AnyTimes()
+		r.EXPECT().MakeClient(gomock.Any(), testUser.OAuth2Token).Return(client).AnyTimes()
+		c.EXPECT().GetEventsBetweenDates(testUser.Remote.ID, gomock.Any(), gomock.Any()).Return([]*remote.Event{}, nil).AnyTimes()
+
+		e.Logger.(*mock_bot.MockLogger).EXPECT().Errorf(gomock.Any()).AnyTimes()
+
+		m := New(e, "").(*mscalendar)
+		jobSummary := &StatusSyncJobSummary{}
+
+		_, _, err := m.retrieveUsersToSyncUsingGoroutines(ctx, userIndex, jobSummary, concurrency)
+		require.ErrorIs(t, err, context.Canceled)
+	})
+
 	t.Run("no users to sync", func(t *testing.T) {
+		ctx := context.Background()
+
 		ctrl := gomock.NewController(t)
 		defer ctrl.Finish()
 
@@ -399,11 +438,13 @@ func TestRetrieveUsersToSyncIndividually(t *testing.T) {
 		m := New(env, "").(*mscalendar)
 		jobSummary := &StatusSyncJobSummary{}
 
-		_, _, err := m.retrieveUsersToSync([]*store.UserShort{}, jobSummary, true)
+		_, _, err := m.retrieveUsersToSyncUsingGoroutines(ctx, []*store.UserShort{}, jobSummary, concurrency)
 		require.ErrorIs(t, errNoUsersNeedToBeSynced, err)
 	})
 
 	t.Run("user reminders and status disabled", func(t *testing.T) {
+		ctx := context.Background()
+
 		testUser := newTestUser()
 		testUser.Settings.UpdateStatus = false
 		testUser.Settings.ReceiveReminders = false
@@ -427,11 +468,13 @@ func TestRetrieveUsersToSyncIndividually(t *testing.T) {
 		m := New(e, "").(*mscalendar)
 		jobSummary := &StatusSyncJobSummary{}
 
-		_, _, err := m.retrieveUsersToSync(userIndex, jobSummary, true)
+		_, _, err := m.retrieveUsersToSyncUsingGoroutines(ctx, userIndex, jobSummary, concurrency)
 		require.ErrorIs(t, err, errNoUsersNeedToBeSynced)
 	})
 
 	t.Run("one user should be synced", func(t *testing.T) {
+		ctx := context.Background()
+
 		testUser := newTestUser()
 		testUser.Settings.UpdateStatus = true
 		testUser.Settings.ReceiveReminders = true
@@ -459,21 +502,23 @@ func TestRetrieveUsersToSyncIndividually(t *testing.T) {
 		m := New(e, "").(*mscalendar)
 		jobSummary := &StatusSyncJobSummary{}
 
-		users, responses, err := m.retrieveUsersToSync(userIndex, jobSummary, true)
+		users, responses, err := m.retrieveUsersToSyncUsingGoroutines(ctx, userIndex, jobSummary, concurrency)
 		require.NoError(t, err)
-		require.Equal(t, []*store.User{testUser}, users)
-		require.Equal(t, []*remote.ViewCalendarResponse{{
+		require.ElementsMatch(t, []*store.User{testUser}, users)
+		require.ElementsMatch(t, []*remote.ViewCalendarResponse{{
 			RemoteUserID: testUser.Remote.ID,
 			Events:       events,
 		}}, responses)
 	})
 
 	t.Run("one user should be synced, one user shouldn't", func(t *testing.T) {
-		testUser := newTestUser()
+		ctx := context.Background()
+
+		testUser := newTestUserNumbered(1)
 		testUser.Settings.UpdateStatus = true
 		testUser.Settings.ReceiveReminders = true
 
-		testUser2 := newTestUserNumbered(1)
+		testUser2 := newTestUserNumbered(2)
 
 		userIndex := []*store.UserShort{
 			{
@@ -504,16 +549,18 @@ func TestRetrieveUsersToSyncIndividually(t *testing.T) {
 		m := New(e, "").(*mscalendar)
 		jobSummary := &StatusSyncJobSummary{}
 
-		users, responses, err := m.retrieveUsersToSync(userIndex, jobSummary, true)
+		users, responses, err := m.retrieveUsersToSyncUsingGoroutines(ctx, userIndex, jobSummary, concurrency)
 		require.NoError(t, err)
-		require.Equal(t, []*store.User{testUser}, users)
-		require.Equal(t, []*remote.ViewCalendarResponse{{
+		require.ElementsMatch(t, []*store.User{testUser}, users)
+		require.ElementsMatch(t, []*remote.ViewCalendarResponse{{
 			RemoteUserID: testUser.Remote.ID,
 			Events:       events,
 		}}, responses)
 	})
 
 	t.Run("two users should be synced", func(t *testing.T) {
+		ctx := context.Background()
+
 		testUser := newTestUserNumbered(1)
 		testUser.Settings.UpdateStatus = true
 		testUser.Settings.ReceiveReminders = true
@@ -555,7 +602,7 @@ func TestRetrieveUsersToSyncIndividually(t *testing.T) {
 		m := New(e, "").(*mscalendar)
 		jobSummary := &StatusSyncJobSummary{}
 
-		users, responses, err := m.retrieveUsersToSync(userIndex, jobSummary, true)
+		users, responses, err := m.retrieveUsersToSyncUsingGoroutines(ctx, userIndex, jobSummary, concurrency)
 		require.NoError(t, err)
 		require.ElementsMatch(t, []*store.User{testUser, testUser2}, users)
 		require.ElementsMatch(t, []*remote.ViewCalendarResponse{{
